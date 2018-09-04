@@ -16,11 +16,24 @@ var (
 			Help: "How far behind the consumer group is from the topic head.",
 		},
 		[]string{
-			"topic",
 			"group",
+			"topic",
 			"partition",
 		},
 	)
+
+	// OffsetDistribution is a Prometheus gauge of kafka offset lag
+	OffsetDistribution = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "kafka_topic_distribution",
+			Help: "How the partition from a topic is distributed.",
+		},
+		[]string{
+			"topic",
+			"partition",
+		},
+	)
+
 	// LookupHist is a Prometheus histogram of our kafka offset lookup time
 	LookupHist = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
@@ -35,6 +48,7 @@ func init() {
 	// Metrics have to be registered to be exposed:
 	prometheus.MustRegister(OffsetLag)
 	prometheus.MustRegister(LookupHist)
+	prometheus.MustRegister(OffsetDistribution)
 }
 
 func prometheusListen(addr string) {

@@ -25,7 +25,13 @@ var (
 	debug          = flag.Bool("debug", false, "Enable debug output.")
 )
 
-type TopicSet map[string]map[int32]int64
+type TopicOffset struct {
+	Begin int64
+	End   int64
+	Total int64
+}
+type TopicSet map[string]map[int32]TopicOffset
+type ConsumerGroupTopics map[string]bool
 
 func init() {
 	if err := envflag.Parse(); err != nil {
@@ -79,14 +85,42 @@ func main() {
 				if *debug {
 					log.Printf("Found topic '%s' with %d partitions", topic, len(partitions))
 				}
-				topicSet[topic] = make(map[int32]int64)
+				topicSet[topic] = make(map[int32]TopicOffset)
+
+				var totalOffsets int64
 				for _, partition := range partitions {
-					toff, err := client.GetOffset(topic, partition, sarama.OffsetNewest)
+					oEnd, err := client.GetOffset(topic, partition, sarama.OffsetNewest)
 					if err != nil {
 						log.Printf("Problem fetching offset for topic '%s', partition '%d'", topic, partition)
 						continue
 					}
-					topicSet[topic][partition] = toff
+
+					oBegin, err := client.GetOffset(topic, partition, sarama.OffsetOldest)
+					if err != nil {
+						log.Printf("Problem fetching offset for topic '%s', partition '%d'", topic, partition)
+						continue
+					}
+
+					var offs TopicOffset
+					offs.Begin = oBegin
+					offs.End = oEnd
+					offs.Total = oEnd - oBegin
+					topicSet[topic][partition] = offs
+
+					totalOffsets += topicSet[topic][partition].Total
+				}
+
+				//	Calculate totalOffsets
+				for _, partition := range partitions {
+					var partitionPercentil float64
+					if topicSet[topic][partition].Total > 0 {
+						partitionPercentil = float64(topicSet[topic][partition].Total*100) / float64(totalOffsets)
+					}
+
+					OffsetDistribution.With(prometheus.Labels{
+						"topic":     topic,
+						"partition": strconv.FormatInt(int64(partition), 10),
+					}).Set(partitionPercentil)
 				}
 			}
 
@@ -94,6 +128,7 @@ func main() {
 			// forever. Ugly hack to clean up data points from time to time.
 			if cycle >= 99 {
 				OffsetLag.Reset()
+				OffsetDistribution.Reset()
 				cycle = 0
 			}
 			cycle++
@@ -128,22 +163,55 @@ func main() {
 func refreshBroker(broker *sarama.Broker, topicSet TopicSet) {
 	groupsRequest := new(sarama.ListGroupsRequest)
 	groupsResponse, err := broker.ListGroups(groupsRequest)
-
 	if err != nil {
 		log.Printf("Could not list groups: %s\n", err.Error())
 		return
 	}
 
-	for group, ptype := range groupsResponse.Groups {
+	//	Find all consumers
+	describeGroupsRequest := new(sarama.DescribeGroupsRequest)
+	for group, t := range groupsResponse.Groups {
+		//log.Printf("Group: name=%s, type=%s\n", group, t)
+		// we only want active consumers
 		// do we want to filter by active consumers?
-		if *activeOnly && ptype != "consumer" {
+		if *activeOnly && t != "consumer" {
 			continue
 		}
-		// This is not very efficient but the kafka API sucks
-		for topic, data := range topicSet {
+
+		describeGroupsRequest.Groups = append(describeGroupsRequest.Groups, group)
+	}
+
+	//	Describe all consumers groups
+	describeGroupsResponse, err := broker.DescribeGroups(describeGroupsRequest)
+	if err != nil {
+		log.Printf("Could not describe groups: %s\n", err.Error())
+		return
+	}
+
+	//log.Printf("Groups: %d\n", len(describeGroupsResponse.Groups))
+	for _, group := range describeGroupsResponse.Groups {
+		consumerGroupTopics := make(ConsumerGroupTopics)
+
+		//	Collect topics name from all members
+		for memberName, member := range group.Members {
+			consumerGroupMemberMetadata, err := member.GetMemberMetadata()
+			if err != nil {
+				log.Printf("Could not get metadata from %s: %s\n", memberName, err.Error())
+				return
+			}
+
+			for _, topic := range consumerGroupMemberMetadata.Topics {
+				consumerGroupTopics[topic] = true
+			}
+		}
+
+		//	Fetch offset for all consumer topic
+		for topic := range consumerGroupTopics {
+			//log.Printf("Process group: groupId=%s, topic=%s\n", group.GroupId, topic)
+			data := topicSet[topic]
 			offsetsRequest := new(sarama.OffsetFetchRequest)
 			offsetsRequest.Version = 1
-			offsetsRequest.ConsumerGroup = group
+			offsetsRequest.ConsumerGroup = group.GroupId
 			for partition := range data {
 				offsetsRequest.AddPartition(topic, partition)
 			}
@@ -155,19 +223,23 @@ func refreshBroker(broker *sarama.Broker, topicSet TopicSet) {
 
 			for _, blocks := range offsetsResponse.Blocks {
 				for partition, block := range blocks {
-					if *debug {
-						log.Printf("Discovered group: %s, topic: %s, partition: %d, offset: %d\n", group, topic, partition, block.Offset)
+					// Because our offset operations aren't atomic we could end up with a negative lag
+					var lag float64
+					if block.Offset < 0 {
+						lag = float64(data[partition].End - data[partition].Begin)
+					} else {
+						lag = float64(data[partition].End) - math.Max(float64(block.Offset), 0)
 					}
-					// Offset will be -1 if the group isn't active on the topic
-					if block.Offset >= 0 {
-						// Because our offset operations aren't atomic we could end up with a negative lag
-						lag := math.Max(float64(data[partition]-block.Offset), 0)
+					lag = math.Max(float64(lag), 0)
 
-						OffsetLag.With(prometheus.Labels{
-							"topic": topic, "group": group,
-							"partition": strconv.FormatInt(int64(partition), 10),
-						}).Set(lag)
+					if *debug {
+						log.Printf("Discovered; group=%s, topic=%s, partition=%d offsets=(begin=%d,end=%d,total=%d,group=%d) -> lag=%f\n",
+							group.GroupId, topic, partition, data[partition].Begin, data[partition].End, data[partition].Total, block.Offset, lag)
 					}
+					OffsetLag.With(prometheus.Labels{
+						"topic": topic, "group": group.GroupId,
+						"partition": strconv.FormatInt(int64(partition), 10),
+					}).Set(lag)
 				}
 			}
 		}
